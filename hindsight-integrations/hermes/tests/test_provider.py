@@ -534,9 +534,61 @@ def test_pre_compress_leaves_recall_indicator_state_alone(provider):
 
 
 def test_pre_compress_caps_output_at_line_boundary(provider):
-    long_text = "\n".join(f"memory line {i} " + "x" * 90 for i in range(120))  # ~12K chars
+    long_text = "\n".join(f"memory line {i} " + "x" * 90 for i in range(120))  # one multi-line memory
     instance, fake = _primed(provider, {}, client=FakeClient(recall_texts=[long_text]))
     block = instance.on_pre_compress(_compress_msgs())
     assert len(block) < 5800
-    assert block.endswith("x")  # whole line, not a mid-word cut
+    import re as _re
+    assert _re.search(r"memory line \d+ x{90}$", block.splitlines()[-1]), "cut must be on a line boundary"
+    # header count must equal the number of kept memory lines
+    kept = [l for l in block.splitlines()[1:] if l.strip()]
+    import re as _re2
+    n = int(_re2.search(r"\((\d+) memories\)", block).group(1))
+    assert n == 1 and len(kept) > 1  # one multi-line memory: count is memories, not lines
+    instance.shutdown()
+
+
+def test_pre_compress_inflight_guard_blocks_second_call(provider):
+    import time as _t
+    class SlowFake(FakeClient):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.calls = 0
+        async def arecall(self, **kwargs):
+            self.calls += 1
+            await __import__("asyncio").sleep(30)
+    slow = SlowFake(recall_texts=["x"])
+    instance, fake = _primed(provider, {"compress_recall_timeout": 0.2}, client=slow)
+    assert instance.on_pre_compress(_compress_msgs()) == ""  # first call times out
+    t0 = _t.time()
+    assert instance.on_pre_compress(_compress_msgs()) == ""  # second call: worker still running
+    assert _t.time() - t0 < 0.5, "second call must not pay the timeout again"
+    instance.shutdown()
+
+
+def test_pre_compress_after_shutdown_returns_empty(provider):
+    instance, fake = _primed(provider, {}, client=FakeClient(recall_texts=["x"]))
+    instance.shutdown()
+    assert instance.on_pre_compress(_compress_msgs()) == ""
+    assert fake.recalls == []
+
+
+def test_pre_compress_do_recall_exception_returns_empty(provider, monkeypatch):
+    instance, fake = _primed(provider, {}, client=FakeClient(recall_texts=["x"]))
+    def boom(*a, **k):
+        raise RuntimeError("bank exploded")
+    monkeypatch.setattr(instance, "_do_recall", boom)
+    assert instance.on_pre_compress(_compress_msgs()) == ""
+    instance.shutdown()
+
+
+def test_pre_compress_d3_override_honored(provider):
+    # default recall_max_input_chars=800 must NOT cap the compress query; the
+    # dedicated 1500 budget applies instead
+    instance, fake = _primed(provider, {}, client=FakeClient(recall_texts=["x"]))
+    msgs = [{"role": "user", "content": "u" * 400} for _ in range(4)]  # 4 users -> ~1496 chars total
+    instance.on_pre_compress(msgs)
+    q = fake.recalls[0]["query"]
+    assert len(q) > 800, f"query must exceed the per-turn 800 cap to prove the override (got {len(q)})"
+    assert len(q) <= 1500
     instance.shutdown()

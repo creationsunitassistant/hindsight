@@ -20,8 +20,6 @@ import queue
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -429,7 +427,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._config = self._api_key = self._client = None
         self._compress_recall_lock = threading.Lock()
         self._compress_recall_inflight = False
-        self._compress_recall_executor = None
         self._embedded_url = None
         self._client_lock = threading.Lock()
         self._api_url, self._mode = _DEFAULT_API_URL, "cloud"
@@ -1309,7 +1306,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # auto_recall doesn't disable anchoring, and a hung bank can never stall compression.
         self._compress_recall = bool(cfg.get("compress_recall", True))
         # <= 0 would make every recall time out; clamp to a sane floor.
-        self._compress_recall_timeout = max(0.1, float(cfg.get("compress_recall_timeout", 3.0)))
+        self._compress_recall_timeout = min(10.0, max(0.1, float(cfg.get("compress_recall_timeout", 3.0))))
         self._compress_recall_max_chars = max(200, int(cfg.get("compress_recall_max_chars", 1500)))
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
@@ -1498,11 +1495,16 @@ class HindsightMemoryProvider(MemoryProvider):
             raise
         return resp.text
 
-    def _do_recall(self, query: str) -> tuple[str, int]:
+    def _do_recall(self, query: str, *, client=None, max_input_chars: int | None = None) -> tuple[str, int]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
         -> (text, memory count); the count is 0 for reflect (synthesis) and on error."""
-        if self._recall_max_input_chars:
-            query = query[: self._recall_max_input_chars]
+        cap = self._recall_max_input_chars
+        if max_input_chars is not None and max_input_chars > 0:
+            cap = max_input_chars  # compress-recall budget replaces the per-turn cap
+        if cap:
+            query = query[:cap]
+        if client is not None:
+            self._client = client
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
@@ -1585,7 +1587,6 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._mode == "local_embedded" and self._client is None:
                 return ""  # embedded client creation starts the daemon: never from the compression path
             client = self._get_client()  # cloud/local_external: cheap cached-or-create
-            _ = client  # noqa: F841 — presence check only; _do_recall resolves its own client
             # Newest-first query, per-message budget so one long assistant reply cannot
             # crowd out user intent. Fixed cap independent of recall_max_input_chars (whose
             # documented 0 = "no truncation" must keep its meaning; _do_recall applies it).
@@ -1610,29 +1611,42 @@ class HindsightMemoryProvider(MemoryProvider):
                 return ""
             # newest-first: leading tokens carry the conversation's current subject
             query = " ".join(parts)[:max_chars]
-            # Single-worker executor: a hard deadline around an operation that can
-            # otherwise block for the full client timeout (120s default). In-flight
-            # guard: while one compress-recall runs, later compressions skip rather
-            # than queue behind it (their anchor would be stale anyway).
+            # Daemon worker + hard deadline: a hung bank can never block compression
+            # (deadline) nor interpreter exit (daemon thread). In-flight guard: while
+            # one compress-recall RUNS, later compressions skip rather than queue
+            # (their anchor would be stale); the flag is cleared by the WORKER's
+            # completion, not by the caller's timeout.
+            if self._shutting_down.is_set():
+                return ""
             with self._compress_recall_lock:
                 if self._compress_recall_inflight:
                     return ""
                 self._compress_recall_inflight = True
-            try:
-                executor = self._compress_recall_executor
-                if executor is None:
-                    executor = self._compress_recall_executor = ThreadPoolExecutor(
-                        max_workers=1, thread_name_prefix="hindsight-compress-recall")
-                future = executor.submit(self._do_recall, query)
+
+            box: Dict[str, Any] = {}
+            done = threading.Event()
+
+            def _worker() -> None:
                 try:
-                    text, count = future.result(timeout=self._compress_recall_timeout)
-                except FuturesTimeoutError:
-                    future.cancel()
-                    logger.info("Hindsight on_pre_compress: recall timed out after %.1fs", self._compress_recall_timeout)
-                    return ""
-            finally:
+                    box["r"] = self._do_recall(query, client=client,
+                                               max_input_chars=self._compress_recall_max_chars)
+                except Exception:
+                    logger.debug("Hindsight compress-recall worker failed", exc_info=True)
+                finally:
+                    with self._compress_recall_lock:
+                        self._compress_recall_inflight = False
+                    done.set()
+
+            try:
+                threading.Thread(target=_worker, name="hindsight-compress-recall", daemon=True).start()
+            except Exception:
                 with self._compress_recall_lock:
                     self._compress_recall_inflight = False
+                raise
+            if not done.wait(self._compress_recall_timeout) or "r" not in box:
+                logger.info("Hindsight on_pre_compress: recall timed out after %.1fs", self._compress_recall_timeout)
+                return ""
+            text, count = box["r"]
             if not text:
                 return ""
             # Line-boundary cap: the host sanitizes to ~6K chars and can cut mid-fact;
@@ -2004,11 +2018,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._run_sync(self._client.aclose())
 
     def shutdown(self) -> None:
-        executor = self._compress_recall_executor
-        self._compress_recall_executor = None
-        self._compress_recall_inflight = False
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
         # Stop accepting retain jobs first so late sync_turn() calls are dropped.
         self._shutting_down.set()
