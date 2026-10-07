@@ -246,6 +246,9 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
+| `compress_recall` | `true` | Recall related memories on Hermes' pre-compression hook (`on_pre_compress`) and inject them into the summary prompt as an anchor, so compaction summaries stay consistent with long-term memory. Independent of `auto_recall`. |
+| `compress_recall_timeout` | `3.0` | Hard deadline in seconds for a compaction-anchor recall. On timeout the hook returns empty — compression is never blocked. |
+| `compress_recall_max_chars` | `1500` | Maximum characters of recent conversation used to build the compaction-anchor query (newest messages first, user turns weighted). |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >

@@ -450,3 +450,93 @@ def test_retain_strategy_is_exposed_as_a_setting(provider):
     instance, _ = provider()
     keys = {option["key"] for option in instance.get_config_schema()}
     assert "retain_strategy" in keys
+
+
+# --- on_pre_compress (compaction-anchor recall) --------------------------------
+
+def _primed(provider_fixture, config=None, client=None):
+    """Provider with the client already built (first recall normally does it)."""
+    instance, fake = provider_fixture(config or {}, client=client)
+    instance._get_client()
+    return instance, fake
+
+
+def _compress_msgs():
+    return [
+        {"role": "user", "content": "Fix the LOVJOY FR translation"},
+        {"role": "tool", "content": "ignored"},
+        {"role": "assistant", "content": "Registered via translationsRegister"},
+        {"role": "user", "content": [{"type": "text", "text": "Now the zoom-vs article"}]},  # list content
+    ]
+
+
+def test_pre_compress_recalls_and_anchors(provider):
+    instance, fake = _primed(provider, {"compress_recall": True}, client=FakeClient(recall_texts=["shopify FR recipe"]))
+    block = instance.on_pre_compress(_compress_msgs())
+    assert "shopify FR recipe" in block and "Facts from long-term memory" in block
+    q = fake.recalls[0]["query"]
+    # newest-first budget: the last user turn leads the query and list content counts
+    assert "zoom-vs article" in q and "LOVJOY FR translation" in q
+    assert q.index("zoom-vs") < q.index("LOVJOY")
+    instance.shutdown()
+
+
+def test_pre_compress_respects_cap_and_user_assistant_only(provider):
+    instance, fake = _primed(provider, {"recall_max_input_chars": 0}, client=FakeClient(recall_texts=["x"]))  # 0 keeps meaning
+    msgs = [{"role": "user", "content": "u" * 5000}, {"role": "system", "content": "s" * 5000}]
+    block = instance.on_pre_compress(msgs)
+    assert len(fake.recalls[0]["query"]) <= 1500
+    assert "sss" not in fake.recalls[0]["query"]
+    instance.shutdown()
+
+
+def test_pre_compress_disabled_returns_empty_and_never_calls_client(provider):
+    instance, fake = _primed(provider, {"compress_recall": False}, client=FakeClient(recall_texts=["x"]))
+    assert instance.on_pre_compress(_compress_msgs()) == ""
+    assert fake.recalls == []
+    instance.shutdown()
+
+
+def test_pre_compress_no_cached_embedded_client_returns_empty(provider, monkeypatch):
+    instance, fake = _primed(provider, {}, client=FakeClient(recall_texts=["x"]))
+    instance._mode = "local_embedded"  # simulate embedded mode with no client yet
+    monkeypatch.setattr(instance, "_new_embedded_client", lambda: (_ for _ in ()).throw(AssertionError("daemon start!")))
+    instance._client = None
+    assert instance.on_pre_compress(_compress_msgs()) == ""  # returns "" without starting the daemon
+    instance.shutdown()
+
+
+def test_pre_compress_slow_recall_times_out_to_empty(provider):
+    import time as _t
+    class SlowFake(FakeClient):
+        async def arecall(self, **kwargs):
+            await __import__("asyncio").sleep(30)
+    instance, fake = _primed(provider, {"compress_recall_timeout": 0.2}, client=SlowFake(recall_texts=["x"]))
+    t0 = _t.time()
+    assert instance.on_pre_compress(_compress_msgs()) == ""
+    assert _t.time() - t0 < 3
+    instance.shutdown()
+
+
+def test_pre_compress_garbage_messages_return_empty(provider):
+    instance, fake = _primed(provider, {}, client=FakeClient(recall_texts=["x"]))
+    assert instance.on_pre_compress([None, "junk", {"role": "user", "content": None}, {}]) == ""
+    assert fake.recalls == []
+    instance.shutdown()
+
+
+def test_pre_compress_leaves_recall_indicator_state_alone(provider):
+    instance, fake = _primed(provider, {"recall_indicator": True}, client=FakeClient(recall_texts=["x"]))
+    instance._last_recall_returned, instance._last_recall_count = False, 0
+    instance.on_pre_compress(_compress_msgs())
+    assert (instance._last_recall_returned, instance._last_recall_count) == (False, 0)
+    instance.shutdown()
+
+
+def test_pre_compress_caps_output_at_line_boundary(provider):
+    long_text = "\n".join(f"memory line {i} " + "x" * 90 for i in range(120))  # ~12K chars
+    instance, fake = _primed(provider, {}, client=FakeClient(recall_texts=[long_text]))
+    block = instance.on_pre_compress(_compress_msgs())
+    assert len(block) < 5800
+    assert block.endswith("x")  # whole line, not a mid-word cut
+    instance.shutdown()
