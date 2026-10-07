@@ -1178,6 +1178,14 @@ RULES
 - **Update** existing content with ``replace_block`` or ``replace_section_blocks``
   when new facts provide corrections, updates, or more specific information
   about topics already in the document.
+- **Update every restatement of a changed value**: when a fact changes a
+  value the document states (an owner, interval, version, status), that old
+  value may appear in more than one block — a summary, a source note, or a
+  "no evidence of <that change>" line. Update each block about that SAME
+  item, so the page does not say "the owner is now Li" in one block and "no
+  owner change was found" in another. The fact must itself name what the
+  block says; never decide a block is wrong by reasoning from neighbouring
+  dates, gaps or other items.
 - **Absence is not contradiction**: an entity, count or detail missing from
   SUPPORTING FACTS is NOT thereby wrong, superseded or removed. The facts are one
   batch, not the whole memory — the document was built from facts you cannot see.
@@ -1453,11 +1461,22 @@ def build_structured_delta_prompt(
                 "where the new facts update something the document already covers."
             )
 
+    # The restatement line (#5228) repeats the system rule here: on gemini-3.1-flash-lite
+    # a stale "no owner change was found" line survived 1/10 with only the system rule,
+    # 4/10 with only this line, 0/10 with both (measured on the first wording). It is
+    # limited to "the item the fact names": that first "check every block" wording made
+    # the model infer from neighbouring release dates that a recorded release never
+    # shipped (test_delta_keeps_unrefuted_claims_llm 9/10 -> 1/10). It sits before the
+    # date-order rule, which must stay last.
     task_footer = (
         "## Task\n"
         "Output a JSON object matching the operations schema. Integrate the new "
         "supporting facts into CURRENT DOCUMENT. Add, update, or remove content "
         "as needed. Preserve unchanged sections and blocks by not mentioning them.\n"
+        "If a new fact changes a value the document states, also update every other "
+        "block that still gives the old value of that same item or says that change "
+        "was not found. Only blocks about the item the fact names — never infer from "
+        "neighbouring dates or other items.\n"
         "Facts arrive out of date order. Before changing what the document says is "
         "current (an owner, version, status or count), put the dated events from the "
         "document and the new facts on one timeline: the latest-dated event is the "
