@@ -20,6 +20,8 @@ import queue
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -425,6 +427,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._config = self._api_key = self._client = None
+        self._compress_recall_lock = threading.Lock()
+        self._compress_recall_inflight = False
+        self._compress_recall_executor = None
         self._embedded_url = None
         self._client_lock = threading.Lock()
         self._api_url, self._mode = _DEFAULT_API_URL, "cloud"
@@ -1300,6 +1305,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
+        # Compaction-anchor recall (on_pre_compress): separate knobs so disabling per-turn
+        # auto_recall doesn't disable anchoring, and a hung bank can never stall compression.
+        self._compress_recall = bool(cfg.get("compress_recall", True))
+        # <= 0 would make every recall time out; clamp to a sane floor.
+        self._compress_recall_timeout = max(0.1, float(cfg.get("compress_recall_timeout", 3.0)))
+        self._compress_recall_max_chars = max(200, int(cfg.get("compress_recall_max_chars", 1500)))
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
         # recall_max_tokens budget); a comma-separated string is accepted for parity
@@ -1545,6 +1556,102 @@ class HindsightMemoryProvider(MemoryProvider):
         if not self._recall_indicator or not self._last_recall_returned:
             return None
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
+
+    @staticmethod
+    def _message_text(message: Any) -> str:
+        """Best-effort text of one chat message: plain string content, or the joined
+        ``text`` blocks of list content (multimodal/Anthropic style). ``""`` otherwise."""
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+            return " ".join(p for p in parts if isinstance(p, str))
+        return ""
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Anchor the compaction summary in long-term memory: before the summarizer
+        runs, recall facts related to the conversation so the summary it produces stays
+        consistent with what the bank already knows. Hermes passes the full transcript
+        as *messages* (raw dicts); this is anchoring, not recovery — facts never retained
+        to the bank cannot be recalled. Best-effort by contract: any failure, or a recall
+        slower than ``compress_recall_timeout`` (default 3s), returns ``""`` and never
+        blocks or breaks compression."""
+        try:
+            if not self._compress_recall or self._mode == "disabled":
+                return ""
+            if self._mode == "local_embedded" and self._client is None:
+                return ""  # embedded client creation starts the daemon: never from the compression path
+            client = self._get_client()  # cloud/local_external: cheap cached-or-create
+            _ = client  # noqa: F841 — presence check only; _do_recall resolves its own client
+            # Newest-first query, per-message budget so one long assistant reply cannot
+            # crowd out user intent. Fixed cap independent of recall_max_input_chars (whose
+            # documented 0 = "no truncation" must keep its meaning; _do_recall applies it).
+            max_chars = self._compress_recall_max_chars
+            max_messages = 8
+            per_message = max(80, max_chars // max_messages)
+            parts: List[str] = []
+            budget = max_chars
+            for m in reversed(messages):
+                if budget <= 0 or len(parts) >= max_messages:
+                    break
+                if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+                    continue
+                text = self._message_text(m).strip()
+                if not text:
+                    continue
+                share = per_message * (2 if m.get("role") == "user" else 1)
+                piece = text[: min(share, budget)]
+                parts.append(piece)
+                budget -= len(piece)
+            if not parts:
+                return ""
+            # newest-first: leading tokens carry the conversation's current subject
+            query = " ".join(parts)[:max_chars]
+            # Single-worker executor: a hard deadline around an operation that can
+            # otherwise block for the full client timeout (120s default). In-flight
+            # guard: while one compress-recall runs, later compressions skip rather
+            # than queue behind it (their anchor would be stale anyway).
+            with self._compress_recall_lock:
+                if self._compress_recall_inflight:
+                    return ""
+                self._compress_recall_inflight = True
+            try:
+                executor = self._compress_recall_executor
+                if executor is None:
+                    executor = self._compress_recall_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="hindsight-compress-recall")
+                future = executor.submit(self._do_recall, query)
+                try:
+                    text, count = future.result(timeout=self._compress_recall_timeout)
+                except FuturesTimeoutError:
+                    future.cancel()
+                    logger.info("Hindsight on_pre_compress: recall timed out after %.1fs", self._compress_recall_timeout)
+                    return ""
+            finally:
+                with self._compress_recall_lock:
+                    self._compress_recall_inflight = False
+            if not text:
+                return ""
+            # Line-boundary cap: the host sanitizes to ~6K chars and can cut mid-fact;
+            # cut cleanly here so the dropped tail is whole memories, not half sentences.
+            max_out = 5000
+            if len(text) > max_out:
+                cut = text.rfind("\n", 0, max_out)
+                text = text[:cut] if cut > 0 else text[:max_out]
+                count = text.count("\n- ") + (1 if text.startswith("- ") else 0)
+                logger.debug("Hindsight on_pre_compress: capped block to %d chars, %d memories kept", len(text), count)
+            header = (
+                f"Facts from long-term memory related to this conversation ({count} memories). "
+                f"Use them to keep names, decisions and details consistent with what the bank already "
+                f"knows; do not copy them into the summary unless the conversation itself discussed them."
+            )
+            return f"{header}\n{text}"
+        except Exception:
+            logger.debug("Hindsight on_pre_compress failed", exc_info=True)
+            return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
@@ -1897,6 +2004,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._run_sync(self._client.aclose())
 
     def shutdown(self) -> None:
+        executor = self._compress_recall_executor
+        self._compress_recall_executor = None
+        self._compress_recall_inflight = False
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
         # Stop accepting retain jobs first so late sync_turn() calls are dropped.
         self._shutting_down.set()
