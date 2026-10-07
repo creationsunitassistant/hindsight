@@ -1659,8 +1659,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Hindsight on_pre_compress: capped block to %d chars, %d memories kept", len(text), count)
             header = (
                 f"Facts from long-term memory related to this conversation ({count} memories). "
-                f"Use them to keep names, decisions and details consistent with what the bank already "
-                f"knows; do not copy them into the summary unless the conversation itself discussed them."
+                f"Use them to keep names, decisions and details consistent with what the bank already knows. "
+                f"When the conversation references a prior decision, include that decision's specifics "
+                f"(ids, URLs, thresholds) in the summary so continuity survives compression; "
+                f"do not copy unrelated facts into the summary."
             )
             return f"{header}\n{text}"
         except Exception:
