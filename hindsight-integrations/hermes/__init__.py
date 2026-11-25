@@ -2354,6 +2354,15 @@ class HindsightMemoryProvider(MemoryProvider):
         """Build one aretain_batch item. The server resolves occurred_start/end (incl.
         relative phrases in content) from the item timestamp: explicit occurred_at
         wins, else the configured event clock."""
+        # Creations Unit fork: never persist a secret-shaped string as a "fact". Core already
+        # redacts at its own memory egress (agent/memory_manager.py); this plugin bypasses it.
+        # Lazy import: the plugin suite and standalone use stub the Hermes core.
+        try:
+            from agent.redact import redact_sensitive_text
+        except ImportError:
+            redact_sensitive_text = None
+        if redact_sensitive_text is not None:
+            content = redact_sensitive_text(content)
         item: Dict[str, Any] = {
             # See #93568.
             "content": content,
